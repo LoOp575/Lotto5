@@ -13,9 +13,9 @@ Perbedaan penting dibanding skrip asli:
 * Kode status dicatat. Tanpa itu, benchmark terhadap nginx statis bisa "sukses"
   padahal yang diukur cuma halaman error 405/400.
 * Persentil memakai nearest-rank yang benar (bukan ``lat[int(reps*0.95)]``).
-* Ada warm-up, ronde yang diselang-seling, dan pengukuran ulang varian yang
-  sama sebagai batas derau (noise floor), supaya selisih kecil tidak
-  dilaporkan sebagai efek.
+* Ada warm-up, ronde yang diselang-seling, dan pengukuran ulang tiap varian
+  sebagai batas derau (noise floor), supaya selisih kecil tidak dilaporkan
+  sebagai efek.
 * Pengaman: hanya mengizinkan target loopback. Target non-loopback butuh
   ``--allow-remote --i-own-this-host``; skrip ini menolak host yang bukan milik
   Anda.
@@ -35,15 +35,15 @@ import math
 import socket
 import ssl
 import statistics
-import sys
 import time
+from collections.abc import Callable, Iterable, Sequence
 from itertools import product
-from typing import Callable, Iterable, Sequence
 
 HeaderList = list[tuple[str, str]]
 
 DEFAULT_METHOD = "GET"
 BODY = b"x" * 64
+METODE_TANPA_BODY = {"GET", "HEAD", "DELETE", "OPTIONS", "TRACE"}
 
 
 # --------------------------------------------------------------------------- #
@@ -51,7 +51,8 @@ BODY = b"x" * 64
 # --------------------------------------------------------------------------- #
 def headers_normal(n: int, width: int = 0) -> HeaderList:
     """n nama header unik yang seluruhnya karakter valid (huruf, angka, '-')."""
-    n = max(1, n)
+    if n < 1:
+        raise ValueError(f"n harus >= 1, bukan {n}")
     out: HeaderList = []
     for i in range(n):
         base = f"x-probe-{i}"
@@ -68,10 +69,22 @@ def headers_collision(n: int, width: int = 0) -> HeaderList:
     yang dikenal, keduanya mengandung karakter di luar tchar (``^``, ``~``) atau
     underscore, jadi nginx menandainya ``invalid_header``.
     """
-    n = max(1, n)
+    if n < 1:
+        raise ValueError(f"n harus >= 1, bukan {n}")
     k = max(1, (n - 1).bit_length())  # 2**k >= n
     keys = ["".join(t) for t in product(("__", "^~"), repeat=k)][:n]
-    return [(k_ + "^" * max(0, width - len(k_)), "1") for k_ in keys]
+    return [(kunci + "^" * max(0, width - len(kunci)), "1") for kunci in keys]
+
+
+def lebar_seragam(sizes: Sequence[int]) -> int:
+    """Panjang nama yang membuat kedua varian memakai byte identik."""
+    if not sizes:
+        return 0
+    n_maks = max(sizes)
+    k = max(1, (n_maks - 1).bit_length())
+    lebar_collision = 2 * k
+    lebar_normal = max(len(f"x-probe-{n_maks - 1}"), 1)
+    return max(lebar_collision, lebar_normal)
 
 
 def header_bytes(hdrs: Sequence[tuple[str, str]]) -> int:
@@ -86,8 +99,9 @@ class Client:
     def __init__(self, host: str, port: int, tls: bool, insecure: bool,
                  timeout: float, method: str):
         self.host, self.port, self.tls = host, port, tls
-        self.timeout, self.method = timeout, method
-        self.method = method
+        self.timeout, self.method = timeout, method.upper()
+        if self.method not in METODE_TANPA_BODY and not BODY:
+            raise ValueError(f"metode {self.method} butuh body")
         self.ctx: ssl.SSLContext | None = None
         if tls:
             self.ctx = ssl.create_default_context()
@@ -95,7 +109,7 @@ class Client:
                 self.ctx.check_hostname = False
                 self.ctx.verify_mode = ssl.CERT_NONE
 
-    def _connect(self) -> http.client.HTTPConnection:
+    def open(self) -> http.client.HTTPConnection:
         if self.tls:
             assert self.ctx is not None
             return http.client.HTTPSConnection(
@@ -104,19 +118,16 @@ class Client:
         return http.client.HTTPConnection(self.host, self.port,
                                           timeout=self.timeout)
 
-    def open(self) -> http.client.HTTPConnection:
-        return self._connect()
-
     def exchange(self, conn: http.client.HTTPConnection,
                  hdrs: Sequence[tuple[str, str]]) -> tuple[int, int]:
         """Kirim satu request pada koneksi yang sudah terbuka."""
         conn.putrequest(self.method, "/", skip_accept_encoding=True)
         for name, value in hdrs:
             conn.putheader(name, value)
-        conn.endheaders(None if self.method == "GET" else BODY)
+        conn.endheaders(None if self.method in METODE_TANPA_BODY else BODY)
         resp = conn.getresponse()
         payload = resp.read()
-        if not resp.isclosed():        # jaga koneksi tetap sinkron
+        if resp.will_close:        # server menutup koneksi: jangan dipakai lagi
             conn.close()
         return resp.status, len(payload)
 
@@ -140,7 +151,17 @@ def percentile(sorted_vals: Sequence[float], p: float) -> float:
     return sorted_vals[min(max(rank, 0), len(sorted_vals) - 1)]
 
 
-def summarise(lat: list[float], statuses: dict[int, int]) -> dict:
+def galat_baku_median(stdev: float, n: int) -> float:
+    """Galat baku median untuk distribusi normal: 1,2533 * sd / sqrt(n)."""
+    if n < 1:
+        raise ValueError("n harus >= 1")
+    return 1.2533 * stdev / math.sqrt(n)
+
+
+def summarise(lat: list[float], statuses: dict[int, int],
+              reconnect: int = 0) -> dict:
+    if not lat:
+        raise ValueError("tidak ada sampel terukur")
     lat_sorted = sorted(lat)
     return {
         "n": len(lat),
@@ -148,8 +169,10 @@ def summarise(lat: list[float], statuses: dict[int, int]) -> dict:
         "mean_ms": round(statistics.fmean(lat_sorted), 3),
         "p95_ms": round(percentile(lat_sorted, 95), 3),
         "p99_ms": round(percentile(lat_sorted, 99), 3),
-        "stdev_ms": round(statistics.pstdev(lat_sorted), 3) if len(lat_sorted) > 1 else 0.0,
+        "stdev_ms": (round(statistics.pstdev(lat_sorted), 3)
+                     if len(lat_sorted) > 1 else 0.0),
         "status": {str(k): v for k, v in sorted(statuses.items())},
+        "reconnect": reconnect,
     }
 
 
@@ -158,14 +181,20 @@ def summarise(lat: list[float], statuses: dict[int, int]) -> dict:
 # --------------------------------------------------------------------------- #
 def measure_variant(client: Client, maker: Callable[[], HeaderList],
                     mode: str, reps: int, warmup: int,
-                    lat: list[float], statuses: dict[int, int]) -> None:
-    for _ in range(warmup):
-        one_shot(client, maker())       # buang halaman pertama / cache dingin
+                    lat: list[float], statuses: dict[int, int]) -> int:
+    """Ukur satu varian; kembalikan jumlah reconnect yang terjadi."""
+    reconnect = 0
+    hdrs = maker()
 
     if mode == "keepalive":
-        hdrs = maker()
         conn = client.open()
         try:
+            for _ in range(warmup):     # warm-up lewat jalur yang sama
+                try:
+                    client.exchange(conn, hdrs)
+                except (http.client.HTTPException, OSError):
+                    conn.close()
+                    conn = client.open()
             for _ in range(reps):
                 t0 = time.perf_counter()
                 try:
@@ -175,97 +204,139 @@ def measure_variant(client: Client, maker: Callable[[], HeaderList],
                     # catat sampel yang tercemar waktu handshake
                     conn.close()
                     conn = client.open()
+                    reconnect += 1
                     continue
                 lat.append((time.perf_counter() - t0) * 1_000)
                 statuses[status] = statuses.get(status, 0) + 1
         finally:
             conn.close()
     else:
+        for _ in range(warmup):
+            one_shot(client, hdrs)
         for _ in range(reps):
             hdrs = maker()
             t0 = time.perf_counter()
             status, _ = one_shot(client, hdrs)
             lat.append((time.perf_counter() - t0) * 1_000)
             statuses[status] = statuses.get(status, 0) + 1
+    return reconnect
+
+
+def _bagi_ronde(reps: int, rounds: int) -> list[int]:
+    """Bagi reps ke rounds sedemikian rupa sehingga totalnya tepat reps."""
+    dasar, sisa = divmod(reps, rounds)
+    return [dasar + (1 if i < sisa else 0) for i in range(rounds)]
 
 
 def run(client: Client, sizes: Iterable[int], mode: str, reps: int,
         rounds: int, warmup: int, width: int) -> list[dict]:
     results: list[dict] = []
-    per_round = max(1, reps // rounds)
+    per_ronde = _bagi_ronde(reps, rounds)
 
     for n in sizes:
-        variants: list[tuple[str, Callable[[], HeaderList]]] = [
+        varian: list[tuple[str, Callable[[], HeaderList]]] = [
             ("normal", lambda n=n: headers_normal(n, width)),
             ("collision", lambda n=n: headers_collision(n, width)),
-            # varian yang sama diukur dua kali: batas derau antar-ronde
+            # tiap varian diukur dua kali: selisihnya = batas derau
             ("normal (ulang)", lambda n=n: headers_normal(n, width)),
+            ("collision (ulang)", lambda n=n: headers_collision(n, width)),
         ]
-        lat = {label: [] for label, _ in variants}
-        st = {label: {} for label, _ in variants}
+        lat = {label: [] for label, _ in varian}
+        st = {label: {} for label, _ in varian}
+        rc = {label: 0 for label, _ in varian}
 
-        for vlabel, maker in variants:      # warm-up per varian
-            measure_variant(client, maker, mode, 0, warmup, lat[vlabel], st[vlabel])
+        for label, maker in varian:
+            rc[label] += measure_variant(client, maker, mode, 0, warmup,
+                                         lat[label], st[label])
 
-        for _ in range(rounds):             # ronde diselang-seling
-            for vlabel, maker in variants:
-                measure_variant(client, maker, mode, per_round, 0,
-                                lat[vlabel], st[vlabel])
+        for j in range(rounds):
+            for label, maker in varian:
+                rc[label] += measure_variant(client, maker, mode, per_ronde[j],
+                                             0, lat[label], st[label])
 
-        payload = header_bytes(variants[0][1]())
-        row = {"n_headers": n, "header_bytes": payload, "variants": {}}
-        for vlabel, _ in variants:
-            row["variants"][vlabel] = summarise(lat[vlabel], st[vlabel])
+        kosong = [label for label, _ in varian if not lat[label]]
+        if kosong:
+            raise RuntimeError(f"tidak ada sampel terukur untuk {kosong}")
+
+        row = {"n_headers": n,
+               "header_bytes": header_bytes(varian[0][1]()),
+               "variants": {}}
+        for label, _ in varian:
+            row["variants"][label] = summarise(lat[label], st[label], rc[label])
         results.append(row)
 
-        base = row["variants"]["normal"]["median_ms"]
-        coll = row["variants"]["collision"]["median_ms"]
-        repl = row["variants"]["normal (ulang)"]["median_ms"]
-        noise = abs(repl - base)
-        delta = coll - base
-        row["noise_floor_ms"] = round(noise, 3)
+        dasar = row["variants"]["normal"]
+        koll = row["variants"]["collision"]
+        derau = max(abs(row["variants"]["normal (ulang)"]["median_ms"]
+                        - dasar["median_ms"]),
+                    abs(row["variants"]["collision (ulang)"]["median_ms"]
+                        - koll["median_ms"]))
+        delta = koll["median_ms"] - dasar["median_ms"]
+        # ambang = 3 x galat baku selisih median (>= 3 sigma), minimal 2% dasar
+        se_selisih = math.hypot(galat_baku_median(dasar["stdev_ms"], dasar["n"]),
+                                galat_baku_median(koll["stdev_ms"], koll["n"]))
+        ambang = max(3 * se_selisih, 0.02 * dasar["median_ms"])
+        row["noise_floor_ms"] = round(derau, 3)
+        row["se_diff_ms"] = round(se_selisih, 3)
+        row["threshold_ms"] = round(ambang, 3)
         row["delta_collision_ms"] = round(delta, 3)
-        row["delta_exceeds_noise"] = abs(delta) > max(noise, 3 * 0.01)
+        row["delta_exceeds_noise"] = abs(delta) > ambang
 
-        print(f"\nn={n}  ({payload} byte header)")
-        for vlabel, _ in variants:
-            s = row["variants"][vlabel]
-            print(f"  {vlabel:16} median={s['median_ms']:7.2f} ms  "
+        print(f"\nn={n}  ({row['header_bytes']} byte header, "
+              f"{mode}, {reps} sampel/varian)")
+        for label, _ in varian:
+            s = row["variants"][label]
+            status = ",".join(f"{k}x{v}" for k, v in s["status"].items())
+            print(f"  {label:18} median={s['median_ms']:7.2f} ms  "
                   f"p95={s['p95_ms']:7.2f} ms  sd={s['stdev_ms']:6.2f}  "
-                  f"status={','.join(f'{k}x{v}' for k, v in s['status'].items())}")
-        print(f"  {'selisih':16} {delta:+.2f} ms  (derau ulang-ukur: {noise:.2f} ms)"
-              f" -> {'DI ATAS derau' if row['delta_exceeds_noise'] else 'di dalam derau'}")
+                  f"n={s['n']}  status={status}"
+                  + (f"  reconnect={s['reconnect']}" if s["reconnect"] else ""))
+        print(f"  {'selisih':18} {delta:+.2f} ms  "
+              f"(derau {derau:.2f} ms, galat baku selisih {se_selisih:.3f} ms, "
+              f"ambang {ambang:.2f} ms) -> "
+              f"{'DI ATAS derau' if row['delta_exceeds_noise'] else 'di dalam derau'}")
     return results
 
 
 # --------------------------------------------------------------------------- #
 # pengaman target
 # --------------------------------------------------------------------------- #
+def alamat_target(host: str) -> list[ipaddress.IPv4Address | ipaddress.IPv6Address]:
+    try:
+        info = socket.getaddrinfo(host, None, proto=socket.IPPROTO_TCP)
+    except socket.gaierror as exc:
+        raise SystemExit(f"tidak bisa me-resolve {host!r}: {exc}") from exc
+    alamat = {ipaddress.ip_address(item[4][0]) for item in info}
+    if not alamat:
+        raise SystemExit(f"{host!r} tidak punya alamat IP")
+    return sorted(alamat, key=str)   # IPv4 dan IPv6 tidak bisa dibandingkan langsung
+
+
 def assert_target_allowed(host: str, allow_remote: bool, owns_host: bool,
                           max_requests: int, projected: int) -> None:
-    try:
-        ip = ipaddress.ip_address(socket.gethostbyname(host))
-    except (socket.gaierror, ValueError) as exc:
-        sys.exit(f"tidak bisa me-resolve {host!r}: {exc}")
+    alamat = alamat_target(host)
+    if any(ip.is_multicast or ip.is_unspecified for ip in alamat):
+        raise SystemExit(f"{host} menunjuk ke alamat multicast/unspecified.")
 
-    if ip.is_multicast or ip.is_unspecified:
-        sys.exit(f"{ip} bukan target yang masuk akal.")
-
-    local = ip.is_loopback or host in {"localhost", "localhost.localdomain"}
-    if not local:
+    lokal = (host in {"localhost", "localhost.localdomain"}
+             or all(ip.is_loopback for ip in alamat))
+    if not lokal:
         if not (allow_remote and owns_host):
-            sys.exit(
-                f"menolak menembak {host} ({ip}): bukan loopback.\n"
+            raise SystemExit(
+                f"menolak menembak {host} ({', '.join(map(str, alamat))}): "
+                "bukan loopback.\n"
                 "Benchmark header seperti ini adalah pengujian beban; ke host\n"
                 "yang bukan milik Anda itu pemindaian tanpa izin. Kalau host\n"
                 "itu memang milik Anda, tambahkan --allow-remote "
                 "--i-own-this-host."
             )
-        print(f"[izin] target non-loopback {host} ({ip}) atas permintaan eksplisit.")
+        print(f"[izin] target non-loopback {host} "
+              f"({', '.join(map(str, alamat))}) atas permintaan eksplisit.")
 
     if projected > max_requests:
-        sys.exit(f"proyeksi {projected} request melebihi batas --max-requests "
-                 f"{max_requests}. Kecilkan --reps/--rounds/--n.")
+        raise SystemExit(f"proyeksi {projected} request melebihi batas "
+                         f"--max-requests {max_requests}. Kecilkan "
+                         "--reps/--rounds/--n.")
 
 
 # --------------------------------------------------------------------------- #
@@ -274,7 +345,8 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--host", default="127.0.0.1")
     ap.add_argument("--port", type=int, default=8080)
     ap.add_argument("--tls", action="store_true", help="pakai HTTPS (SNI + verifikasi)")
-    ap.add_argument("--insecure", action="store_true", help="matikan verifikasi sertifikat")
+    ap.add_argument("--insecure", action="store_true",
+                    help="matikan verifikasi sertifikat")
     ap.add_argument("--mode", choices=("keepalive", "new-conn"), default="keepalive")
     ap.add_argument("--n", type=int, nargs="+", default=[100, 300, 1000],
                     help="jumlah header per request")
@@ -282,7 +354,7 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--rounds", type=int, default=4)
     ap.add_argument("--warmup", type=int, default=3)
     ap.add_argument("--width", type=int, default=0,
-                    help="panjang nama header disamakan (0 = apa adanya)")
+                    help="panjang nama header disamakan (0 = otomatis)")
     ap.add_argument("--method", default=DEFAULT_METHOD)
     ap.add_argument("--timeout", type=float, default=10.0)
     ap.add_argument("--max-requests", type=int, default=5000)
@@ -291,12 +363,21 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--json", metavar="PATH", help="tulis hasil mentah ke JSON")
     args = ap.parse_args(argv)
 
-    if args.n and args.width == 0:
-        args.width = max(len(f"x-probe-{max(args.n) - 1}"),
-                         max(len("".join(t)) for t in product(("__", "^~"),
-                             repeat=max(1, (max(args.n) - 1).bit_length()))))
+    # validasi masukan: tolak nilai yang tidak masuk akal, jangan dikoersi diam-diam
+    if any(n < 1 for n in args.n):
+        ap.error("--n harus >= 1")
+    if args.reps < 1:
+        ap.error("--reps harus >= 1")
+    if not 1 <= args.rounds <= args.reps:
+        ap.error("--rounds harus antara 1 dan --reps")
+    if args.warmup < 0:
+        ap.error("--warmup tidak boleh negatif")
+    if args.width < 0:
+        ap.error("--width tidak boleh negatif")
+    if args.width == 0:
+        args.width = lebar_seragam(args.n)
 
-    projected = len(args.n) * 3 * (args.warmup + args.reps)
+    projected = len(args.n) * 4 * (args.warmup + args.reps)
     assert_target_allowed(args.host, args.allow_remote, args.i_own_this_host,
                           args.max_requests, projected)
 
@@ -305,16 +386,16 @@ def main(argv: list[str] | None = None) -> int:
 
     scheme = "https" if args.tls else "http"
     print(f"target      : {scheme}://{args.host}:{args.port}/")
-    print(f"mode        : {args.mode}, {args.reps} sampel/varian, "
+    print(f"mode        : {args.mode} {args.method}, {args.reps} sampel/varian, "
           f"{args.rounds} ronde, {args.warmup} warm-up")
     print(f"panjang nama: {args.width} karakter (byte per grup identik)")
 
     try:
         status, _ = one_shot(client, headers_normal(1, args.width))
     except Exception as exc:                      # noqa: BLE001
-        sys.exit(f"target tidak menjawab: {exc!r}")
+        raise SystemExit(f"target tidak menjawab: {exc!r}") from exc
     print(f"probe awal  : status {status}"
-          + ("  (perhatikan: bukan 2xx -> yang diukur halaman error)"
+          + ("  (bukan 2xx -> yang diukur halaman error)"
              if not 200 <= status < 300 else ""))
 
     results = run(client, args.n, args.mode, args.reps, args.rounds,

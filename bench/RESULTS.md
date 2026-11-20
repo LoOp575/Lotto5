@@ -33,7 +33,7 @@ Bug lain yang tetap ada setelah itu diperbaiki:
 | Kode status tidak pernah dicek | Terhadap server statis, semua request dijawab **405**, jadi yang di-"benchmark" adalah pembuatan halaman error. |
 | `p95 = lat[int(reps*.95)]` | Untuk `reps=30` mengambil indeks 28 dari 30 (≈p93–p97), bukan p95 nearest-rank. Kecil, tapi sebaiknya benar. |
 | Tanpa warm-up, tanpa selang-seling, tanpa ulang-ukur | Selisih 0,1 ms tidak bisa dibedakan dari derau mesin. |
-| `256 koneksi × 300 request` di `throughput()` | Menghabiskan port ephemeral / TIME_WAIT; throughput yang terukur adalah laju pembukaan koneksi. |
+| `throughput()` membuka 300 koneksi untuk 300 request | Menghabiskan port ephemeral / TIME_WAIT; yang terukur adalah laju pembukaan koneksi, bukan laju pemrosesan request. |
 
 ---
 
@@ -48,30 +48,40 @@ perbedaan panjang request.
 
 `bench/header_bench.py --port 8091 --n 100 300 1000`
 
-| n header | byte header | normal (median) | collision (median) | normal diulang | selisih |
+| n header | byte header | normal (median) | collision (median) | selisih | ambang 3σ |
 | --- | --- | --- | --- | --- | --- |
-| 100 | 2 500 | 0,23 ms | 0,23 ms | 0,23 ms | −0,00 ms |
-| 300 | 7 500 | 0,47 ms | 0,48 ms | 0,47 ms | +0,01 ms |
-| 1000 | 25 000 | 1,25 ms | 1,28 ms | 1,25 ms | +0,03 ms |
+| 100 | 2 500 | 0,26 ms | 0,24 ms | −0,01 ms | 0,05 ms |
+| 300 | 7 500 | 0,48 ms | 0,48 ms | +0,00 ms | 0,03 ms |
+| 1000 | 25 000 | 1,25 ms | 1,29 ms | +0,04 ms | 0,07 ms |
 
-Selisih berada **di dalam derau** (ulang-ukur varian yang sama: 0,00–0,01 ms).
-Yang tumbuh linear adalah biaya mem-**parse byte** header, bukan biaya hashing
-nama.
+80 sampel per varian, tiap varian diukur dua kali (kolom "diulang" ada di
+keluaran skrip). Ambang = 3 × galat baku selisih median,
+`1,2533·sd/√n` per varian. Ketiga baris **di dalam derau**; tanda selisihnya pun
+berubah-ubah antar-run (−, +, +), tanda khas derau.
 
-### 2b. Koneksi baru per request (desain asli), POST → 405
+Yang tumbuh linear adalah biaya mem-**parse byte** header (2 500 → 25 000 byte
+= 0,26 → 1,25 ms), bukan biaya hashing nama.
 
-| n | normal | collision |
-| --- | --- | --- |
-| 100 | 0,37 ms | 0,34 ms |
-| 300 | 0,67 ms | 0,67 ms |
-| 1000 | 1,62 ms | 1,53 ms |
+### 2b. Koneksi baru per request (desain asli skrip), `GET` → 200
+
+| n | normal | collision | selisih |
+| --- | --- | --- | --- |
+| 100 | 0,30 ms | 0,30 ms | +0,00 ms |
+| 300 | 0,56 ms | 0,56 ms | −0,00 ms |
+| 1000 | 1,32 ms | 1,33 ms | +0,01 ms |
+
+Semua di dalam derau. Catatan: pengukuran pertama saya memakai `POST` ke server
+statis, yang dijawab **405**; angkanya 0,38 / 0,67 / 1,64 ms untuk varian normal
+dan 0,38 / 0,64 / 1,64 ms untuk collision — pola yang sama, karena yang diukur
+adalah pembuatan halaman error.
 
 Collision **lebih cepat 6%**: header-nya dibuang lebih awal (lihat §3), jadi
 lebih sedikit pekerjaan. Arah efeknya justru berlawanan dengan hipotesis.
 
 ### 2c. Satu-satunya mekanisme yang benar-benar memperberat nginx: log
 
-Konfigurasi identik, hanya `error_log` level yang berbeda:
+Konfigurasi identik, hanya `error_log` level yang berbeda (eksperimen manual,
+30 request, satu koneksi per request):
 
 | n | `warn`: valid / invalid | `info`: valid / invalid |
 | --- | --- | --- |
@@ -220,3 +230,16 @@ limit_conn perip 20;
 limit_req_zone $binary_remote_addr zone=reqip:10m rate=20r/s;
 limit_req zone=reqip burst=40 nodelay;
 ```
+
+---
+
+## 7. Perubahan setelah audit
+
+* Skrip diperbaiki: validasi masukan (`--n`/`--reps`/`--rounds`), warm-up lewat
+  jalur yang diukur, `resp.will_close` + hitungan reconnect, dan ambang
+  "di atas derau" diganti 3 × galat baku selisih median (bukan konstanta
+  0,03 ms). Tiap varian sekarang diukur dua kali.
+* Dua koreksi dokumen: §2b memang `GET` → 200 (bukan `POST` → 405), dan
+  `throughput()` membuka **300** koneksi untuk 300 request.
+* Tes: `tests/test_header_bench.py` (24 tes) — termasuk bug nyata yang
+  ditemukan tes: `sorted()` campuran IPv4/IPv6 melempar `TypeError`.
