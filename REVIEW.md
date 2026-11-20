@@ -182,3 +182,36 @@ Akibatnya tidak bisa diimpor atau diuji.
 3. **D1** cepat (satu baris data rusak), lalu **D3/D6**.
 4. **B1–B6** untuk harness, plus dua koreksi `RESULTS.md`.
 5. **T10–T13 / D2/D4/D5** bersifat peningkatan, bukan pemblokir.
+
+---
+
+## Status perbaikan (diperbarui)
+
+| Item | Status | Bukti |
+| --- | --- | --- |
+| T1 | ✅ `Togel.py` membaca `Logo.csv` lewat `Path(__file__)`, pesan jelas kalau hilang | `tests/test_togel.py::test_file_hilang_pesan_jelas` |
+| T2 | ✅ loader TSV tanpa header, `dtype=str`, nama kolom `posisi1..7` | `test_baca_tsv_dan_pertahankan_nol_di_depan` |
+| T3 | ✅ `input_shape` dari `X.shape[1]` (280), bukan sparse index | `test_one_hot_digit_280_biner` |
+| T4 | ✅ prediksi memakai encoder yang sama (`one_hot_digit`) | `Togel.py:main` |
+| T5 | ✅ target = satu posisi, 10 000 kelas (pilihan Anda) | `--posisi`, `test_buat_dataset_pasangan_lag_satu` |
+| T6 | ✅ one-hot per digit dengan vocabulary tetap 0–9, 280 fitur | `test_one_hot_digit_280_biner` |
+| T7 | ✅ nol di depan utuh (`'0745'` tetap `'0745'`) | `test_ke_digit_bentuk_dan_isi` |
+| T8 | ✅ tidak ada preprocessing yang di-fit pada seluruh data | `buat_dataset` + `bagi_data` |
+| T9 | ✅ `tf.keras.utils.set_random_seed(--seed)` | `bangun_model` |
+| T10 | ✅ baseline kelas mayoritas dilaporkan | `test_baseline_mayoritas` |
+| T11 | ✅ loss `sparse_categorical_crossentropy` + metrik top-1/top-5 | `top_k_akurasi` |
+| T12 | ✅ `Dropout(0.2)` + `EarlyStopping(patience=15)` | `bangun_model`, `main` |
+| T13 | ✅ fungsi terpisah + `main()` + `--dry-run` | `test_dry_run_tidak_butuh_tensorflow` |
+| D1 | ⚠️ loader memvalidasi & melaporkan baris 27 yang cuma 4 kolom; **isinya belum bisa dilengkapi** karena 3 angka sisanya tidak diketahui | `test_baris_tidak_lengkap_dibuang_dengan_peringatan` |
+| D3 | ✅ `requirements.txt`, `requirements-dev.txt` | — |
+| D6 | ✅ README: skema data, cara jalan, batasan, catatan baris 27 | — |
+| B1 | ✅ `--n`, `--reps`, `--rounds`, `--warmup`, `--width` divalidasi | `test_cli_menolak_masukan_tidak_masuk_akal` |
+| B2 | ✅ ambang = 3 × galat baku selisih median, tiap varian diukur 2× | `test_galat_baku_median` |
+| B3 | ✅ `resp.will_close` + penghitung reconnect | `summarise` |
+| B4 | ✅ warm-up lewat jalur yang sama dengan yang diukur | `measure_variant` |
+| B5 | ✅ `self.method` sekali; metode body/ tanpa body divalidasi | `Client.__init__` |
+| B6 | ✅ 47 tes (`tests/`) | `pytest tests -q` |
+| B7 | ✅ `getaddrinfo`, semua alamat dicek; bug urutan IPv4/IPv6 ditemukan tes dan diperbaiki | `test_target_publik_ditolak_tanpa_izin` |
+| B8 | ✅ `ruff check` bersih (E,F,W,B,UP,SIM,RET,ARG,C4,PIE) | — |
+| D4 (LICENSE/CI) | ⏳ belum dikerjakan | — |
+| D5 (nama file `Logo.csv` vs `Loto.csv`) | ⏳ belum diubah; menunggu keputusan Anda | — |
