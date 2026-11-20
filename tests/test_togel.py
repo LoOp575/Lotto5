@@ -93,6 +93,12 @@ def test_buat_dataset_pasangan_lag_satu(tmp_path):
     assert X[0].sum() == 28
 
 
+def test_butuh_minimal_dua_undian(tmp_path):
+    df = Togel.muat_data(tulis_csv(tmp_path, VALID[:1]))
+    with pytest.raises(ValueError, match="minimal 2 undian"):
+        Togel.buat_dataset(df, posisi=1)
+
+
 def test_posisi_di_luar_rentang_ditolak(tmp_path):
     df = Togel.muat_data(tulis_csv(tmp_path, VALID))
     for posisi in (0, 8):
@@ -151,6 +157,15 @@ def test_baseline_mayoritas():
 # --------------------------------------------------------------------------- #
 # CLI
 # --------------------------------------------------------------------------- #
+def test_peringatan_kelas_tidak_beririsan(tmp_path, capsys):
+    # 4 undian unik -> tidak ada kelas yang sama antara latih dan validasi
+    path = tulis_csv(tmp_path, VALID)
+
+    assert Togel.main(["--data", str(path), "--dry-run"]) == 0
+    err = capsys.readouterr().err
+    assert "tidak ada satu pun kelas" in err
+
+
 def test_dry_run_tidak_butuh_tensorflow(tmp_path, capsys):
     path = tulis_csv(tmp_path, VALID)
 

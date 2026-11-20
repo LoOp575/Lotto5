@@ -109,6 +109,11 @@ def buat_dataset(df: pd.DataFrame, posisi: int) -> tuple[np.ndarray, np.ndarray]
     """Bangun (X, y) berpasangan: fitur = undian t-1, target = posisi p undian t."""
     if not 1 <= posisi <= N_POSISI:
         raise ValueError(f"--posisi harus 1..{N_POSISI}, bukan {posisi}")
+    if len(df) < 2:
+        raise ValueError(
+            f"butuh minimal 2 undian untuk membentuk satu pasangan fitur-target, "
+            f"tersedia {len(df)}"
+        )
 
     digits = ke_digit(df)
     angka = df.to_numpy(dtype=str)
@@ -191,6 +196,15 @@ def main(argv: list[str] | None = None) -> int:
     print(f"sampel         : {len(X)} (latih {len(X_tr)}, validasi {len(X_val)})")
     print(f"fitur          : {X.shape[1]} biner (7 posisi x 4 digit x 10)")
     print(f"target         : posisi {args.posisi}, {N_KELAS} kelas")
+
+    bersama = set(y_tr.tolist()) & set(y_val.tolist())
+    if not bersama:
+        print(f"[peringatan] tidak ada satu pun kelas yang muncul di latih dan "
+              f"validasi ({len(set(y_tr.tolist()))} vs {len(set(y_val.tolist()))} "
+              "kelas, semuanya unik). Top-1 di validasi akan 0% untuk model apa "
+              "pun, jadi angka metrik di bawah tidak mengukur kualitas model.\n"
+              "             Butuh riwayat undian yang jauh lebih panjang, atau "
+              "target yang lebih kasar (mis. satu digit).", file=sys.stderr)
 
     kelas_base, akurasi_base = baseline_mayoritas(y_tr, y_val)
     print(f"baseline       : kelas {kelas_base:04d} "
